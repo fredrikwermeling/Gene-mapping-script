@@ -1,134 +1,132 @@
-# Gene Mapping Script v2
-# This script processes a list of gene names that were not found in an initial query
-# and attempts to identify known synonyms and human and mouse orthologues.
-#
-# Required R packages: dplyr, readr, stringr, tidyr
-
 library(dplyr)
 library(readr)
 library(stringr)
 library(tidyr)
 
-# ----- Configuration ---------------------------------------------------------
+# File paths
+genes_file   <- "your_gene_list.txt"
+mrk_file     <- "MRK_List1.rpt"
+hmd_file     <- "HMD_HumanPhenotype.rpt"
+biomart_file <- "human+mouse synonym.txt"
 
-# Base path for input files (update if needed)
-base_path <- "./data"
-
-# Define generic paths for the input files.
-genes_not_found_file <- file.path(base_path, "your_gene_list.txt")
-mrk_file           <- file.path(base_path, "MRK_List1.rpt")
-hmd_file           <- file.path(base_path, "HMD_HumanPhenotype.rpt")
-
-# ----- Helper Function -------------------------------------------------------
-
-# Creates an output folder named with today’s date.
-# If a folder with that name exists, a unique folder is created.
-create_output_folder <- function(path) {
-    today <- as.character(Sys.Date())
-    output_path <- file.path(path, today)
-    count <- 1
-    while (dir.exists(output_path)) {
-        output_path <- file.path(path, paste0(today, "_", count))
-        count <- count + 1
-    }
-    dir.create(output_path, recursive = TRUE)
-    return(output_path)
+# Use the directory of the gene list for output
+genes_dir <- dirname(normalizePath(genes_file))
+create_out_folder <- function(base_dir) {
+  today <- as.character(Sys.Date())
+  out <- file.path(base_dir, today)
+  i <- 1
+  while (dir.exists(out)) {
+    out <- file.path(base_dir, paste0(today, "_", i))
+    i <- i + 1
+  }
+  dir.create(out)
+  out
 }
+output_folder <- create_out_folder(genes_dir)
 
-# Create an output folder in the same folder as the input files.
-output_folder <- create_output_folder(base_path)
+# Load data
+genes <- read_lines(genes_file) %>% tolower() %>% trimws()
+mrk   <- read_tsv(mrk_file, col_types = cols(.default = "c"))
+hmd   <- read_tsv(hmd_file, col_names = c("Human", "x1", "Mouse", "MGI", "x2", "x3"), col_types = cols(.default = "c"))
+bio   <- read_tsv(biomart_file, col_names = c("S1", "S2"), col_types = cols(.default = "c"))
 
-# ----- Data Loading and Preparation ----------------------------------------
+# Standardize text
+mrk <- mrk %>% 
+  mutate(`Marker Symbol` = tolower(trimws(`Marker Symbol`)),
+         `Current Marker Symbol (if withdrawn)` = tolower(trimws(`Current Marker Symbol (if withdrawn)`)))
+hmd <- hmd %>% 
+  mutate(Human = tolower(trimws(Human)),
+         Mouse = tolower(trimws(Mouse)))
+bio <- bio %>% 
+  mutate(S1 = tolower(trimws(S1)),
+         S2 = tolower(trimws(S2)))
 
-# Read the list of genes (one per line) that were not found,
-# converting all text to lowercase and trimming extra spaces.
-genes_not_found <- read_lines(genes_not_found_file) %>% 
-    tolower() %>%
-    trimws()
-
-# Read the MRK list file (tab-delimited). All columns are imported as characters.
-mrk_df <- read_tsv(mrk_file, col_types = cols(.default = "c"))
-
-# Read the HMD phenotype file with specified column names.
-hmd_df <- read_tsv(hmd_file, 
-                   col_names = c("Human_Symbol", "Unknown1", "Mouse_Symbol", "MGI_ID", "Unknown2", "Unknown3"),
-                   col_types = cols(.default = "c"))
-
-# Standardize gene name fields for matching.
-mrk_df <- mrk_df %>%
-    mutate(
-        `Marker Symbol` = tolower(trimws(`Marker Symbol`)),
-        `Current Marker Symbol (if withdrawn)` = tolower(trimws(`Current Marker Symbol (if withdrawn)`))
-    )
-
-hmd_df <- hmd_df %>%
-    mutate(
-        Mouse_Symbol = tolower(trimws(Mouse_Symbol)),
-        Human_Symbol = tolower(trimws(Human_Symbol))
-    )
-
-# ----- Mapping Process -------------------------------------------------------
-
-# Build a unique map for gene synonyms from the MRK file.
-synonyms_map <- mrk_df %>% 
-    select(`Marker Symbol`, `Current Marker Symbol (if withdrawn)`) %>%
-    distinct()
-
-# For each gene in our not-found list, try to locate a synonym.
-synonyms <- sapply(genes_not_found, function(gene) {
-    alt <- synonyms_map %>%
-        filter(`Marker Symbol` == gene) %>%
-        pull(`Current Marker Symbol (if withdrawn)`)
-    
-    if (length(alt) == 0) "NA" else paste(unique(alt[!is.na(alt)]), collapse = ", ")
+# Retrieve synonyms from MRK and BioMart
+syn_map <- mrk %>% select(`Marker Symbol`, `Current Marker Symbol (if withdrawn)`) %>% distinct()
+mrk_syn <- sapply(genes, function(g) {
+  alt <- syn_map %>% filter(`Marker Symbol` == g) %>% pull(`Current Marker Symbol (if withdrawn)`)
+  if (length(alt) == 0) "NA" else paste(unique(alt[!is.na(alt)]), collapse = ", ")
+})
+bio_syn <- sapply(genes, function(g) {
+  alt <- c(bio %>% filter(S1 == g) %>% pull(S2),
+           bio %>% filter(S2 == g) %>% pull(S1))
+  if (length(alt) == 0) "NA" else paste(unique(alt[!is.na(alt)]), collapse = ", ")
 })
 
-# 1. Look up human orthologues for mouse genes by checking the Mouse_Symbol column.
-human_orthologues <- sapply(genes_not_found, function(gene) {
-    gene_synonyms <- unlist(str_split(synonyms[genes_not_found == gene], ",\\s*"))
-    matches <- hmd_df %>%
-        filter(Mouse_Symbol == gene | Mouse_Symbol %in% gene_synonyms) %>%
-        pull(Human_Symbol)
-    
-    if (length(matches) == 0) "NA" else paste(unique(matches[!is.na(matches)]), collapse = ", ")
+# Overall orthologue lookup (using original gene + synonyms)
+human_ortho <- sapply(genes, function(g) {
+  s1 <- if (mrk_syn[genes == g] == "NA") character(0) else unlist(str_split(mrk_syn[genes == g], ",\\s*"))
+  s2 <- if (bio_syn[genes == g] == "NA") character(0) else unlist(str_split(bio_syn[genes == g], ",\\s*"))
+  all_names <- unique(c(g, s1, s2))
+  m <- hmd %>% filter(Mouse %in% all_names) %>% pull(Human)
+  if (length(m) == 0) "NA" else paste(unique(m[!is.na(m)]), collapse = ", ")
+})
+mouse_ortho <- sapply(genes, function(g) {
+  s1 <- if (mrk_syn[genes == g] == "NA") character(0) else unlist(str_split(mrk_syn[genes == g], ",\\s*"))
+  s2 <- if (bio_syn[genes == g] == "NA") character(0) else unlist(str_split(bio_syn[genes == g], ",\\s*"))
+  all_names <- unique(c(g, s1, s2))
+  m <- hmd %>% filter(Human %in% all_names) %>% pull(Mouse)
+  if (length(m) == 0) "NA" else paste(unique(m[!is.na(m)]), collapse = ", ")
 })
 
-# 2. Look up mouse orthologues for human genes by checking the Human_Symbol column.
-mouse_orthologues <- sapply(genes_not_found, function(gene) {
-    gene_synonyms <- unlist(str_split(synonyms[genes_not_found == gene], ",\\s*"))
-    matches <- hmd_df %>%
-        filter(Human_Symbol == gene | Human_Symbol %in% gene_synonyms) %>%
-        pull(Mouse_Symbol)
-    
-    if (length(matches) == 0) "NA" else paste(unique(matches[!is.na(matches)]), collapse = ", ")
+# Orthologues based on synonyms only
+human_ortho_syn <- sapply(genes, function(g) {
+  s1 <- if (mrk_syn[genes == g] == "NA") character(0) else unlist(str_split(mrk_syn[genes == g], ",\\s*"))
+  s2 <- if (bio_syn[genes == g] == "NA") character(0) else unlist(str_split(bio_syn[genes == g], ",\\s*"))
+  syn_only <- unique(c(s1, s2))
+  if (length(syn_only) == 0) return("NA")
+  m <- hmd %>% filter(Mouse %in% syn_only) %>% pull(Human)
+  if (length(m) == 0) "NA" else paste(unique(m[!is.na(m)]), collapse = ", ")
+})
+mouse_ortho_syn <- sapply(genes, function(g) {
+  s1 <- if (mrk_syn[genes == g] == "NA") character(0) else unlist(str_split(mrk_syn[genes == g], ",\\s*"))
+  s2 <- if (bio_syn[genes == g] == "NA") character(0) else unlist(str_split(bio_syn[genes == g], ",\\s*"))
+  syn_only <- unique(c(s1, s2))
+  if (length(syn_only) == 0) return("NA")
+  m <- hmd %>% filter(Human %in% syn_only) %>% pull(Mouse)
+  if (length(m) == 0) "NA" else paste(unique(m[!is.na(m)]), collapse = ", ")
 })
 
-# Assemble the results into a detailed dataframe.
-detailed_output <- data.frame(
-    Original_Gene     = genes_not_found,
-    Synonym           = synonyms,
-    Human_Orthologue  = human_orthologues,
-    Mouse_Orthologue  = mouse_orthologues,
-    stringsAsFactors  = FALSE
+# Assemble detailed results and compute totals
+results <- data.frame(
+  Gene              = genes,
+  MRK_Synonym       = mrk_syn,
+  BioMart_Synonym   = bio_syn,
+  Human_Orthologue  = human_ortho,
+  Mouse_Orthologue  = mouse_ortho,
+  Human_Ort_SynOnly = human_ortho_syn,
+  Mouse_Ort_SynOnly = mouse_ortho_syn,
+  stringsAsFactors  = FALSE
 )
 
-# Save the detailed mapping results.
-detailed_file <- file.path(output_folder, "detailed_gene_mapping.csv")
-write_csv(detailed_output, detailed_file)
+results <- results %>% rowwise() %>% mutate(
+  Total_Orthologues = {
+    vals <- c_across(c(Human_Orthologue, Mouse_Orthologue, Human_Ort_SynOnly, Mouse_Ort_SynOnly))
+    vals_split <- unlist(lapply(vals, function(x) {
+      if (is.na(x) || x == "NA") character(0) else str_split(x, ",\\s*")[[1]]
+    }))
+    length(unique(vals_split[vals_split != ""]))
+  },
+  Total_Suggestions = {
+    vals <- c_across(c(MRK_Synonym, BioMart_Synonym, Human_Orthologue, Mouse_Orthologue, Human_Ort_SynOnly, Mouse_Ort_SynOnly))
+    vals_split <- unlist(lapply(vals, function(x) {
+      if (is.na(x) || x == "NA") character(0) else str_split(x, ",\\s*")[[1]]
+    }))
+    length(unique(vals_split[vals_split != ""]))
+  }
+) %>% ungroup()
 
-# Generate a simplified, two-column version.
-# This breaks out each suggestion (synonym or orthologue) into its own row.
-two_col <- detailed_output %>%
-    pivot_longer(cols = c(Synonym, Human_Orthologue, Mouse_Orthologue), 
-                 names_to = "Type", values_to = "Suggestion") %>%
-    separate_rows(Suggestion, sep = ",\\s*") %>%
-    filter(Suggestion != "NA") %>%
-    distinct()
+write_csv(results, file.path(output_folder, "detailed_gene_mapping.csv"))
 
-# Save the two-column output.
-two_col_file <- file.path(output_folder, "two_column_gene_mapping.csv")
-write_csv(two_col, two_col_file)
+# Create condensed output; pivot only suggestion columns (excluding totals)
+two_col <- results %>% 
+  pivot_longer(cols = -c(Gene, Total_Orthologues, Total_Suggestions),
+               names_to = "Type", values_to = "Suggestion") %>% 
+  separate_rows(Suggestion, sep = ",\\s*") %>% 
+  mutate(Suggestion = trimws(Suggestion)) %>%
+  filter(Suggestion != "NA", Suggestion != "", !is.na(Suggestion)) %>% 
+  distinct()
 
-cat("Processing complete!\n")
-cat("Detailed mapping saved to:", detailed_file, "\n")
-cat("Two-column mapping saved to:", two_col_file, "\n")
+write_csv(two_col, file.path(output_folder, "condensed_gene_mapping.csv"))
+
+cat("Processing complete.\nOutput folder:", output_folder, "\n")
